@@ -11,6 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from alarms import AlarmLedger
+from errors import ApiError
+from impact import ImpactAnalyzer
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -20,11 +24,6 @@ def now() -> str:
 
 def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -81,8 +80,30 @@ class Store:
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS facility_contacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, facility_id INTEGER NOT NULL REFERENCES facilities(id),
+          name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', reachable INTEGER NOT NULL DEFAULT 1,
+          updated_by TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(facility_id,name)
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, outage_id INTEGER NOT NULL REFERENCES outages(id),
+          facility_id INTEGER NOT NULL REFERENCES facilities(id), outage_revision INTEGER NOT NULL,
+          content TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sent','acknowledged','resend')),
+          is_current INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          sent_by TEXT, sent_at TEXT, acked_by TEXT, acked_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_current ON notifications(outage_id,facility_id) WHERE is_current=1;
+        CREATE TABLE IF NOT EXISTS notification_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, notification_id INTEGER NOT NULL REFERENCES notifications(id),
+          event_type TEXT NOT NULL CHECK(event_type IN ('send','urge','ack','resend_flag','withdraw')),
+          actor TEXT NOT NULL, at TEXT NOT NULL, note TEXT
+        );
         """)
         self.conn.commit()
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(facilities)")}
+        if "essential_load_mw" not in columns:
+            self.conn.execute("ALTER TABLE facilities ADD COLUMN essential_load_mw REAL NOT NULL DEFAULT 0")
+            self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -92,7 +113,10 @@ class Store:
 
 
 class GridService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.impact = ImpactAnalyzer(self.conn)
+        self.alarms = AlarmLedger(self.conn, self.impact)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -117,14 +141,28 @@ class GridService:
         except sqlite3.IntegrityError as exc: raise ApiError(409, "资产代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "asset_type": asset_type, "capacity_mw": capacity_mw, "region": region, "parent_id": parent_id}
 
-    def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float) -> dict:
+    def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float, essential_load_mw: float = 0) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
         self._row("assets", asset_id)
-        if priority not in {1, 2, 3} or backup_power_mw < 0: raise ApiError(400, "重要用户参数不合法")
+        if priority not in {1, 2, 3} or backup_power_mw < 0 or essential_load_mw < 0: raise ApiError(400, "重要用户参数不合法")
         with self.conn:
-            cur = self.conn.execute("INSERT INTO facilities(name,facility_type,asset_id,priority,backup_power_mw) VALUES(?,?,?,?,?)", (name, facility_type, asset_id, priority, backup_power_mw))
+            cur = self.conn.execute("INSERT INTO facilities(name,facility_type,asset_id,priority,backup_power_mw,essential_load_mw) VALUES(?,?,?,?,?,?)",
+                                    (name, facility_type, asset_id, priority, backup_power_mw, essential_load_mw))
             self.store.audit(actor, "facility.register", "facility", cur.lastrowid, {"name": name, "priority": priority})
-        return {"id": cur.lastrowid, "name": name, "facility_type": facility_type, "asset_id": asset_id, "priority": priority, "backup_power_mw": backup_power_mw}
+        return {"id": cur.lastrowid, "name": name, "facility_type": facility_type, "asset_id": asset_id, "priority": priority,
+                "backup_power_mw": backup_power_mw, "essential_load_mw": essential_load_mw}
+
+    def set_contact(self, actor: str | None, role: str | None, facility_id: int, name: str, phone: str, reachable: bool) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        self._row("facilities", facility_id)
+        if not name.strip(): raise ApiError(400, "联系人姓名不能为空")
+        with self.conn:
+            self.conn.execute("""INSERT INTO facility_contacts(facility_id,name,phone,reachable,updated_by,updated_at) VALUES(?,?,?,?,?,?)
+                               ON CONFLICT(facility_id,name) DO UPDATE SET phone=excluded.phone,reachable=excluded.reachable,
+                               updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+                              (facility_id, name, phone, int(bool(reachable)), actor, now()))
+            self.store.audit(actor, "contact.set", "facility", facility_id, {"name": name, "reachable": bool(reachable)})
+        return dict(self.conn.execute("SELECT * FROM facility_contacts WHERE facility_id=? AND name=?", (facility_id, name)).fetchone())
 
     def create_outage(self, actor: str | None, role: str | None, incident_code: str, title: str, affected_regions: list[str]) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -139,6 +177,20 @@ class GridService:
                                     (incident_code, title, j(affected_regions), actor, now(), now()))
             self.store.audit(actor, "outage.create", "outage", cur.lastrowid, {"incident_code": incident_code})
         return self._outage_dict(self._row("outages", cur.lastrowid))
+
+    def revise_outage(self, actor: str | None, role: str | None, outage_id: int, title: str, affected_regions: list[str]) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        outage = self._row("outages", outage_id)
+        if outage["state"] == "restored": raise ApiError(409, "事故已恢复完成，不能变更")
+        title = title or outage["title"]
+        regions = affected_regions or json.loads(outage["affected_regions_json"])
+        if not regions: raise ApiError(400, "影响区域不能为空")
+        with self.conn:
+            self.conn.execute("UPDATE outages SET title=?,affected_regions_json=?,revision=revision+1,updated_at=? WHERE id=?",
+                              (title, j(regions), now(), outage_id))
+            self.store.audit(actor, "outage.revise", "outage", outage_id, {"title": title, "affected_regions": regions})
+        self.alarms.sync_outage_revision(outage_id, actor)
+        return self._outage_dict(self._row("outages", outage_id))
 
     def record_telemetry(self, actor: str | None, role: str | None, asset_id: int, load_mw: float, voltage_kv: float, timestamp: str) -> dict:
         actor = self._actor(actor, role, {"operator"})
@@ -163,6 +215,7 @@ class GridService:
                                     (outage_id, version, j(normalized), actor, now()))
             self.conn.execute("UPDATE outages SET state='assessing',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
             self.store.audit(actor, "plan.create", "plan", cur.lastrowid, {"outage_id": outage_id, "version": version, "steps": len(normalized)})
+        self.alarms.sync_outage_revision(outage_id, actor)
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
     def submit_plan(self, actor: str | None, role: str | None, plan_id: int, expected_revision: int) -> dict:
@@ -190,6 +243,7 @@ class GridService:
             if updated.rowcount != 1: raise ApiError(409, "计划版本冲突")
             self.conn.execute("UPDATE outages SET state='restoring',revision=revision+1,updated_at=? WHERE id=?", (now(), plan["outage_id"]))
             self.store.audit(actor, "plan.activate", "plan", plan_id, {"outage_id": plan["outage_id"], "version": plan["version"]})
+        self.alarms.sync_outage_revision(plan["outage_id"], actor)
         return self._plan_dict(self._row("plans", plan_id))
 
     def make_plan_change(self, actor: str | None, role: str | None, base_plan_id: int, steps: list[dict], expected_revision: int) -> dict:
@@ -262,12 +316,49 @@ class GridService:
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
                   "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
                   "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+        if status["state"] == "restored":
+            blockers = self.alarms.restore_blockers(outage_id)
+            if blockers:
+                detail = "；".join(f"{b['facility_name']}（{'、'.join(b['reasons'])}）" for b in blockers)
+                raise ApiError(409, f"一级用户未满足恢复完成条件：{detail}")
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
             if status["state"] == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
             self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
+        if status["state"] == "restored": self.alarms.sync_outage_revision(outage_id, actor)
         return {"id": cur.lastrowid, "status": status}
+
+    def issue_notifications(self, actor: str | None, role: str | None, outage_id: int) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        board = self.alarms.issue_for_outage(outage_id, actor)
+        with self.conn:
+            self.store.audit(actor, "notification.issue", "outage", outage_id, {"facilities": len(board["facilities"])})
+        return board
+
+    def urge_notification(self, actor: str | None, role: str | None, notification_id: int, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        view = self.alarms.urge(notification_id, actor, note)
+        with self.conn:
+            self.store.audit(actor, "notification.urge", "notification", notification_id, {"note": note})
+        return view
+
+    def ack_notification(self, actor: str | None, role: str | None, notification_id: int, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher", "field"})
+        view = self.alarms.acknowledge(notification_id, actor, note)
+        with self.conn:
+            self.store.audit(actor, "notification.ack", "notification", notification_id, {"note": note})
+        return view
+
+    def resend_notification(self, actor: str | None, role: str | None, notification_id: int) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        view = self.alarms.resend(notification_id, actor)
+        with self.conn:
+            self.store.audit(actor, "notification.resend", "notification", notification_id, {})
+        return view
+
+    def delivery_board(self, outage_id: int) -> dict:
+        return self.alarms.delivery_board(outage_id)
 
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         if not steps: raise ApiError(400, "恢复计划至少需要一个步骤")
@@ -328,13 +419,16 @@ class GridService:
                 "outages": [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")],
                 "plans": [self._plan_dict(row) for row in self.conn.execute("SELECT * FROM plans ORDER BY id DESC")],
                 "telemetry_anomalies": [dict(row) for row in self.conn.execute("SELECT * FROM telemetry WHERE valid=0 ORDER BY id DESC LIMIT 20")],
+                "notifications": [dict(row) for row in self.conn.execute("SELECT * FROM notifications WHERE is_current=1 ORDER BY id DESC")],
+                "notification_events": [dict(row) for row in self.conn.execute("SELECT * FROM notification_events ORDER BY id DESC LIMIT 30")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM assets LIMIT 1").fetchone():
             a = self.register_asset("dispatcher-demo", "dispatcher", "SUB-1", "中心站", "substation", 200, "城区")
             self.register_asset("dispatcher-demo", "dispatcher", "LINE-1", "一号线", "line", 120, "城区", a["id"])
-            self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
+            hospital = self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50, 40)
+            self.set_contact("dispatcher-demo", "dispatcher", hospital["id"], "医院配电室", "95598-1", True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -355,6 +449,7 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "delivery": out = self.service.delivery_board(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -368,6 +463,12 @@ class Handler(BaseHTTPRequestHandler):
             if p == ["api", "assets"]: out = self.service.register_asset(actor, role, b.get("code", ""), b.get("name", ""), b.get("asset_type", "line"), float(b.get("capacity_mw", 0)), b.get("region", ""), b.get("parent_id"))
             elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)))
             elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []))
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "revise": out = self.service.revise_outage(actor, role, int(p[2]), b.get("title", ""), b.get("affected_regions") or [])
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "notifications": out = self.service.issue_notifications(actor, role, int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "facilities"] and p[3] == "contacts": out = self.service.set_contact(actor, role, int(p[2]), b.get("name", ""), b.get("phone", ""), bool(b.get("reachable", True)))
+            elif len(p) == 4 and p[:2] == ["api", "notifications"] and p[3] == "urge": out = self.service.urge_notification(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "notifications"] and p[3] == "ack": out = self.service.ack_notification(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "notifications"] and p[3] == "resend": out = self.service.resend_notification(actor, role, int(p[2]))
             elif p == ["api", "telemetry"]: out = self.service.record_telemetry(actor, role, int(b.get("asset_id", 0)), float(b.get("load_mw", 0)), float(b.get("voltage_kv", 0)), b.get("timestamp", ""))
             elif p == ["api", "plans"]: out = self.service.create_plan(actor, role, int(b.get("outage_id", 0)), b.get("steps", []))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "submit": out = self.service.submit_plan(actor, role, int(p[2]), int(b.get("expected_revision", -1)))

@@ -9,7 +9,7 @@ class GridFlowTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.s = GridService(Store(Path(self.tmp.name) / "g.db"))
         self.sub = self.s.register_asset("dispatcher", "dispatcher", "SUB", "中心站", "substation", 200, "A")
         self.line = self.s.register_asset("dispatcher", "dispatcher", "LINE", "线路", "line", 100, "A", self.sub["id"])
-        self.s.register_facility("dispatcher", "dispatcher", "医院", "hospital", self.sub["id"], 1, 50)
+        self.hosp = self.s.register_facility("dispatcher", "dispatcher", "医院", "hospital", self.sub["id"], 1, 50)
 
     def tearDown(self): self.s.store.close(); self.tmp.cleanup()
 
@@ -40,6 +40,11 @@ class GridFlowTest(unittest.TestCase):
         plan2 = self.s.activate_plan("dispatcher", "dispatcher", plan2["id"], plan2["revision"])
         self.s.field_report("field", "field", plan2["id"], 2, "client-2", plan2["version"], "completed", "已送电")
         self.s.confirm_step("dispatcher", "dispatcher", plan2["id"], 2, "confirmed")
+        self.s.set_contact("dispatcher", "dispatcher", self.hosp["id"], "值班电工", "123456", True)
+        board = self.s.issue_notifications("dispatcher", "dispatcher", outage["id"])
+        for item in board["facilities"]:
+            if item["notification"]:
+                self.s.ack_notification("field", "field", item["notification"]["id"])
         status = self.s.publish_status("dispatcher", "dispatcher", outage["id"], plan2["id"])
         self.assertEqual("restored", status["status"]["state"])
 

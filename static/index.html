@@ -1,1 +1,70 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:32px auto;padding:0 20px}
+section{border:1px solid #ddd;border-radius:6px;padding:12px 16px;margin:14px 0}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;font-size:14px;vertical-align:top}
+.ok{color:#070}.bad{color:#b00}.warn{color:#a60}
+pre{background:#f3f5f7;padding:16px;overflow:auto;font-size:13px}
+button{padding:4px 10px;margin:2px}
+h2{font-size:18px}h3{margin:6px 0}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>操作人：<input id="actor" value="dispatcher-demo" size="14"> 角色：<select id="role"><option>dispatcher</option><option>operator</option><option>field</option></select>
+<button onclick="loadAll()">刷新状态</button></p>
+<h2>按事故看待送达</h2>
+<div id="outages">加载中...</div>
+<h2>原始状态</h2>
+<pre id="state"></pre>
+<script>
+const LABEL={sent:'待回执',acknowledged:'已回执',resend:'待重发'};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const hdrs=()=>({'Content-Type':'application/json','X-Actor':actor.value,'X-Role':role.value});
+async function post(path,body){
+  const r=await fetch(path,{method:'POST',headers:hdrs(),body:JSON.stringify(body||{})});
+  const d=await r.json(); if(!r.ok) alert(d.error||'操作失败');
+  await loadAll(); return d;
+}
+const issue=id=>post(`/api/outages/${id}/notifications`);
+const urge=id=>post(`/api/notifications/${id}/urge`,{note:prompt('催办备注','请尽快回执')||''});
+const ack=id=>post(`/api/notifications/${id}/ack`);
+const resend=id=>post(`/api/notifications/${id}/resend`);
+async function loadAll(){
+  const s=await (await fetch('/api/state')).json();
+  document.getElementById('state').textContent=JSON.stringify(s,null,2);
+  const box=document.getElementById('outages'); box.innerHTML='';
+  if(!s.outages.length){ box.textContent='暂无事故'; return; }
+  for(const o of s.outages){
+    const d=await (await fetch(`/api/outages/${o.id}/delivery`)).json();
+    box.insertAdjacentHTML('beforeend',render(d));
+  }
+}
+function render(d){
+  const o=d.outage;
+  const rows=d.facilities.map(f=>{
+    const n=f.notification;
+    const urges=f.events.filter(e=>e.event_type==='urge').length;
+    const contacts=f.contacts.map(c=>
+      `<span class="${c.reachable?'ok':'bad'}">${esc(c.name)} ${c.reachable?'可联系':'失联'}</span>（${esc(c.updated_by)} @ ${esc(c.updated_at)}）`
+    ).join('<br>')||'<span class="bad">无联系人</span>';
+    const note=n
+      ?`<b>${LABEL[n.state]}</b>（第${n.outage_revision}版）<br>发送 ${esc(n.sent_by)} @ ${esc(n.sent_at)}<br>`+
+       (n.acked_by?`回执 ${esc(n.acked_by)} @ ${esc(n.acked_at)}`:'<span class="warn">未回执</span>')+
+       (urges?`<br>已催办 ${urges} 次`:'')+
+       `<br><button onclick="urge(${n.id})">催办</button>`+
+       (n.state==='sent'?` <button onclick="ack(${n.id})">回执</button>`:'')+
+       (n.state==='resend'?` <button onclick="resend(${n.id})">重发</button>`:'')
+      :'<span class="bad">未生成</span>';
+    return `<tr><td>${esc(f.facility.name)}</td><td>${f.facility.priority} 级</td><td>${esc(f.asset.code)}</td>`+
+      `<td class="${f.backup_ok?'ok':'bad'}">${f.facility.backup_power_mw} / ${f.facility.essential_load_mw} MW</td>`+
+      `<td>${contacts}</td><td>${note}</td></tr>`;
+  }).join('');
+  const blockers=d.blockers.length
+    ?`<p class="bad">恢复完成阻断：${d.blockers.map(b=>`${esc(b.facility_name)}（${b.reasons.join('、')}）`).join('；')}</p>`:'';
+  return `<section><h3>${esc(o.incident_code)} ${esc(o.title)} <small>第 ${o.revision} 版 · ${esc(o.state)}</small></h3>`+
+    `<button onclick="issue(${o.id})">生成/重发通知</button>${blockers}`+
+    `<table><tr><th>重要用户</th><th>优先级</th><th>所属线路</th><th>备用/必需</th><th>联系人</th><th>当前通知</th></tr>`+
+    `${rows||'<tr><td colspan="6">无受影响用户</td></tr>'}</table></section>`;
+}
+loadAll();
+</script></html>
