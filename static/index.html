@@ -1,1 +1,69 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>电网恢复调度 - 告警台账</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2933}
+h1{margin-bottom:4px}.sub{color:#52606d;margin-top:0}
+.bar{display:flex;gap:10px;align-items:center;margin:14px 0;flex-wrap:wrap}
+select,input,button{font:inherit;padding:6px 10px;border:1px solid #cbd2d9;border-radius:6px}
+button{cursor:pointer;background:#2b6cb0;color:#fff;border-color:#2b6cb0}
+button.ghost{background:#fff;color:#2b6cb0}
+button.warn{background:#b7791f;border-color:#b7791f}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+th,td{border:1px solid #e4e7eb;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#f5f7fa}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.s-pending{background:#edf2f7;color:#4a5568}.s-sent{background:#e6fffa;color:#0d7377}
+.s-pending_resend{background:#fffaf0;color:#9c4221}.s-acked{background:#f0fff4;color:#276749}
+.s-superseded{background:#fff5f5;color:#9b2c2c;text-decoration:line-through}
+.bad{color:#c53030;font-weight:600}.ok{color:#276749}
+.muted{color:#7b8794;font-size:12px}
+.events{max-height:260px;overflow:auto;background:#f9fafb;padding:10px;border-radius:6px;font-size:13px}
+.events div{padding:3px 0;border-bottom:1px dashed #e4e7eb}
+#error{color:#c53030;min-height:20px;margin:6px 0;font-weight:600}
+.card{border:1px solid #e4e7eb;border-radius:8px;padding:14px 16px;margin:14px 0}
+</style>
+</head>
+<body>
+<h1>电网事故应急与恢复调度</h1>
+<p class="sub">告警台账：按线路父子关系确定影响对象，同一对象只保留一条当前通知；事故版本变动后未回执内容转待重发。</p>
+
+<div class="bar">
+  <label>身份 <input id="actor" value="dispatcher-demo" size="14"></label>
+  <label>角色
+    <select id="role">
+      <option value="dispatcher">dispatcher 调度员</option>
+      <option value="operator">operator 运维</option>
+      <option value="field">field 现场</option>
+    </select>
+  </label>
+  <label>事故
+    <select id="outageSel"></select>
+  </label>
+  <button onclick="loadOutage()">按事故查看送达</button>
+  <button class="ghost" onclick="reconcile()">按线路关系补齐台账</button>
+  <button class="ghost" onclick="loadState()">全局状态</button>
+</div>
+<div id="error"></div>
+
+<div class="card">
+  <h3 id="outageTitle">请选择事故</h3>
+  <div id="summary" class="muted"></div>
+  <table id="alertTable" hidden>
+    <thead><tr><th>级别</th><th>重要用户</th><th>当前通知状态</th><th>备用电源</th><th>联系人</th>
+      <th>送达（人/时间）</th><th>催办（人/时间）</th><th>回执（人/时间）</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>操作留痕（催办、回执均记录时间与操作人）</h3>
+  <div id="events" class="events">暂无</div>
+</div>
+
+<pre id="state" hidden></pre>
+<script src="/static/app.js"></script>
+</body>
+</html>

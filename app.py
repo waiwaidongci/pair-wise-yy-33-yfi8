@@ -6,25 +6,15 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from alerts import AlertLedger
+from common import ApiError, j, now
+from impact import affected_asset_ids, affected_facilities
+
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -47,7 +37,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS outages (
           id INTEGER PRIMARY KEY AUTOINCREMENT, incident_code TEXT UNIQUE NOT NULL, title TEXT NOT NULL,
           state TEXT NOT NULL CHECK(state IN ('reported','assessing','restoring','restored')),
-          affected_regions_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+          affected_regions_json TEXT NOT NULL, asset_id INTEGER REFERENCES assets(id),
+          revision INTEGER NOT NULL DEFAULT 1,
           opened_by TEXT NOT NULL, opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS plans (
@@ -82,7 +73,13 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        # 旧库迁移：事故挂接故障根资产
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(outages)")}
+        if "asset_id" not in cols:
+            self.conn.execute("ALTER TABLE outages ADD COLUMN asset_id INTEGER REFERENCES assets(id)")
         self.conn.commit()
+        # 告警台账表结构由 alerts 模块自行维护（关注点分离）
+        AlertLedger(self.conn, self.audit).init_schema()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -92,7 +89,9 @@ class Store:
 
 
 class GridService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.ledger = AlertLedger(self.conn, store.audit)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -126,19 +125,24 @@ class GridService:
             self.store.audit(actor, "facility.register", "facility", cur.lastrowid, {"name": name, "priority": priority})
         return {"id": cur.lastrowid, "name": name, "facility_type": facility_type, "asset_id": asset_id, "priority": priority, "backup_power_mw": backup_power_mw}
 
-    def create_outage(self, actor: str | None, role: str | None, incident_code: str, title: str, affected_regions: list[str]) -> dict:
+    def create_outage(self, actor: str | None, role: str | None, incident_code: str, title: str, affected_regions: list[str], asset_id: int | None = None) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
         if not incident_code.strip() or not affected_regions: raise ApiError(400, "事故编号和影响区域不能为空")
+        if asset_id is not None: asset_id = int(asset_id); self._row("assets", asset_id)
         existing = self.conn.execute("SELECT * FROM outages WHERE incident_code=?", (incident_code,)).fetchone()
         if existing:
-            if existing["title"] == title and json.loads(existing["affected_regions_json"]) == affected_regions:
+            if existing["title"] == title and json.loads(existing["affected_regions_json"]) == affected_regions and existing["asset_id"] == asset_id:
                 return self._outage_dict(existing)
             raise ApiError(409, "事故编号已存在但内容不同")
         with self.conn:
-            cur = self.conn.execute("INSERT INTO outages(incident_code,title,state,affected_regions_json,opened_by,opened_at,updated_at) VALUES(?,?,'reported',?,?,?,?)",
-                                    (incident_code, title, j(affected_regions), actor, now(), now()))
-            self.store.audit(actor, "outage.create", "outage", cur.lastrowid, {"incident_code": incident_code})
-        return self._outage_dict(self._row("outages", cur.lastrowid))
+            cur = self.conn.execute("INSERT INTO outages(incident_code,title,state,affected_regions_json,asset_id,opened_by,opened_at,updated_at) VALUES(?,?,'reported',?,?,?,?,?)",
+                                    (incident_code, title, j(affected_regions), asset_id, actor, now(), now()))
+            outage_id = cur.lastrowid
+            self.store.audit(actor, "outage.create", "outage", outage_id, {"incident_code": incident_code, "asset_id": asset_id})
+            # 按线路父子关系建档：同一事故下同一对象只有一条台账
+            created = self.ledger.ensure_for_outage(self._row("outages", outage_id), actor)
+            if created: self.store.audit(actor, "alert.seed", "outage", outage_id, {"alerts": created})
+        return self._outage_dict(self._row("outages", outage_id))
 
     def record_telemetry(self, actor: str | None, role: str | None, asset_id: int, load_mw: float, voltage_kv: float, timestamp: str) -> dict:
         actor = self._actor(actor, role, {"operator"})
@@ -161,7 +165,7 @@ class GridService:
         with self.conn:
             cur = self.conn.execute("INSERT INTO plans(outage_id,version,state,steps_json,created_by,created_at) VALUES(?,?, 'draft',?,?,?)",
                                     (outage_id, version, j(normalized), actor, now()))
-            self.conn.execute("UPDATE outages SET state='assessing',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
+            self._bump_outage_revision(outage_id, "assessing", "事故进入评估、新建恢复计划", actor)
             self.store.audit(actor, "plan.create", "plan", cur.lastrowid, {"outage_id": outage_id, "version": version, "steps": len(normalized)})
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
@@ -188,7 +192,7 @@ class GridService:
             updated = self.conn.execute("UPDATE plans SET state='active',revision=revision+1,activated_at=? WHERE id=? AND revision=?",
                                         (now(), plan_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "计划版本冲突")
-            self.conn.execute("UPDATE outages SET state='restoring',revision=revision+1,updated_at=? WHERE id=?", (now(), plan["outage_id"]))
+            self._bump_outage_revision(plan["outage_id"], "restoring", "恢复计划已启用", actor)
             self.store.audit(actor, "plan.activate", "plan", plan_id, {"outage_id": plan["outage_id"], "version": plan["version"]})
         return self._plan_dict(self._row("plans", plan_id))
 
@@ -209,6 +213,7 @@ class GridService:
                                     (outage["id"], version, j(normalized), actor, now()))
             self.conn.execute("UPDATE plans SET state='superseded' WHERE id=?", (base_plan_id,))
             self._copy_confirmations(base_plan_id, cur.lastrowid, normalized, confirmed)
+            self._bump_outage_revision(outage["id"], None, f"计划变更产生新版本 v{version}", actor)
             self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed)})
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
@@ -259,15 +264,52 @@ class GridService:
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
         completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        blockers = self.ledger.restore_blockers(outage_id)
+        fully_completed = completed == len(steps)
+        # 一级用户备用电源不足、联系人失联或尚未回执时，不能发布恢复完成
+        if fully_completed and blockers:
+            self.store.audit(actor, "status.publish_blocked", "outage", outage_id, {"plan_id": plan_id, "blockers": blockers})
+            self.conn.commit()
+            raise ApiError(409, "一级重要用户条件不满足，不能发布恢复完成：" + "；".join(
+                f"{b['facility']}（{'、'.join(b['reasons'])}）" for b in blockers))
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
-                  "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
-                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+                  "state": "restored" if fully_completed else "restoring", "completed_steps": completed, "total_steps": len(steps),
+                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"],
+                  "restore_blockers": blockers}
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
             if status["state"] == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
             self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
         return {"id": cur.lastrowid, "status": status}
+
+    # ---- 告警台账（服务层薄封装，规则在 alerts 模块） --------------------
+
+    def alerts_for_outage(self, outage_id: int) -> dict:
+        return self.ledger.list_for_outage(outage_id)
+
+    def reconcile_alerts(self, actor: str | None, role: str | None, outage_id: int) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        outage = self._row("outages", outage_id)
+        if outage["asset_id"] is None: raise ApiError(400, "该事故未挂接故障资产，无法推算影响范围")
+        with self.conn:
+            created = self.ledger.ensure_for_outage(outage, actor)
+            if created: self.store.audit(actor, "alert.reconcile", "outage", outage_id, {"alerts": created})
+        return self.ledger.list_for_outage(outage_id)
+
+    def outage_scope(self, outage_id: int) -> dict:
+        """影响范围预览：只做线路父子关系推算，不涉及通知状态。"""
+        outage = self._row("outages", outage_id)
+        if outage["asset_id"] is None: return {"outage_id": outage_id, "asset_id": None, "affected_assets": [], "affected_facilities": []}
+        asset_ids = affected_asset_ids(self.conn, int(outage["asset_id"]))
+        facilities = affected_facilities(self.conn, int(outage["asset_id"]), include_disconnected=True)
+        assets = [dict(self.conn.execute("SELECT id,code,name,asset_type,parent_id,region FROM assets WHERE id=?", (aid,)).fetchone())
+                  for aid in asset_ids]
+        return {"outage_id": outage_id, "asset_id": outage["asset_id"],
+                "affected_assets": assets,
+                "affected_facilities": [{"id": f["id"], "name": f["name"], "priority": f["priority"],
+                                         "backup_power_mw": f["backup_power_mw"], "connected": bool(f["connected"])}
+                                        for f in facilities]}
 
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         if not steps: raise ApiError(400, "恢复计划至少需要一个步骤")
@@ -309,6 +351,19 @@ class GridService:
             if cur.rowcount != 1: raise ApiError(409, "并发计划更新冲突")
             self.store.audit(actor, action, "plan", plan["id"], details)
 
+    def _bump_outage_revision(self, outage_id: int, new_state: str | None, reason: str, actor: str) -> int:
+        """推进事故版本：revision+1，并让已送达未回执的通知转待重发（须在事务内调用）。"""
+        if new_state:
+            cur = self.conn.execute("UPDATE outages SET state=?,revision=revision+1,updated_at=? WHERE id=?",
+                                    (new_state, now(), outage_id))
+        else:
+            cur = self.conn.execute("UPDATE outages SET revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
+        if cur.rowcount != 1: raise ApiError(404, "事故不存在")
+        revision = int(self.conn.execute("SELECT revision FROM outages WHERE id=?", (outage_id,)).fetchone()[0])
+        flipped = self.ledger.mark_revision(outage_id, revision, reason)
+        self.store.audit(actor, "outage.revision", "outage", outage_id, {"revision": revision, "reason": reason, "alerts_to_resend": flipped})
+        return revision
+
     def plan_detail(self, plan_id: int) -> dict:
         plan = self._plan_dict(self._row("plans", plan_id))
         return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
@@ -316,7 +371,7 @@ class GridService:
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
-                "affected_regions": json.loads(row["affected_regions_json"]), "revision": row["revision"]}
+                "affected_regions": json.loads(row["affected_regions_json"]), "asset_id": row["asset_id"], "revision": row["revision"]}
 
     def _plan_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "outage_id": row["outage_id"], "version": row["version"], "state": row["state"],
@@ -327,6 +382,7 @@ class GridService:
                 "facilities": [dict(row) for row in self.conn.execute("SELECT * FROM facilities ORDER BY priority,id")],
                 "outages": [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")],
                 "plans": [self._plan_dict(row) for row in self.conn.execute("SELECT * FROM plans ORDER BY id DESC")],
+                "alerts": self.ledger.all_alerts(),
                 "telemetry_anomalies": [dict(row) for row in self.conn.execute("SELECT * FROM telemetry WHERE valid=0 ORDER BY id DESC LIMIT 20")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
@@ -334,7 +390,9 @@ class GridService:
         if not self.conn.execute("SELECT id FROM assets LIMIT 1").fetchone():
             a = self.register_asset("dispatcher-demo", "dispatcher", "SUB-1", "中心站", "substation", 200, "城区")
             self.register_asset("dispatcher-demo", "dispatcher", "LINE-1", "一号线", "line", 120, "城区", a["id"])
-            self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
+            branch = self.register_asset("dispatcher-demo", "dispatcher", "LINE-1-B", "一号线北支", "line", 60, "城北", self.conn.execute("SELECT id FROM assets WHERE code='LINE-1'").fetchone()[0])
+            self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", branch["id"], 1, 50)
+            self.register_facility("dispatcher-demo", "dispatcher", "城北水厂", "water", branch["id"], 2, 0)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -355,8 +413,12 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "scope": out = self.service.outage_scope(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "alerts": out = self.service.alerts_for_outage(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif p == ["static", "app.js"]:
+                page = (Path(__file__).parent / "static" / "app.js").read_bytes(); self.send_response(200); self.send_header("Content-Type", "application/javascript; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -367,7 +429,8 @@ class Handler(BaseHTTPRequestHandler):
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "assets"]: out = self.service.register_asset(actor, role, b.get("code", ""), b.get("name", ""), b.get("asset_type", "line"), float(b.get("capacity_mw", 0)), b.get("region", ""), b.get("parent_id"))
             elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)))
-            elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []))
+            elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []), b.get("asset_id"))
+            elif len(p) == 5 and p[:2] == ["api", "outages"] and p[3:] == ["alerts", "reconcile"]: out = self.service.reconcile_alerts(actor, role, int(p[2]))
             elif p == ["api", "telemetry"]: out = self.service.record_telemetry(actor, role, int(b.get("asset_id", 0)), float(b.get("load_mw", 0)), float(b.get("voltage_kv", 0)), b.get("timestamp", ""))
             elif p == ["api", "plans"]: out = self.service.create_plan(actor, role, int(b.get("outage_id", 0)), b.get("steps", []))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "submit": out = self.service.submit_plan(actor, role, int(p[2]), int(b.get("expected_revision", -1)))
@@ -377,6 +440,12 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "send": out = self.service.ledger.send(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "resend": out = self.service.ledger.resend(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "remind": out = self.service.ledger.remind(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "ack": out = self.service.ledger.ack(actor, role, int(p[2]), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "contact": out = self.service.ledger.set_contact(actor, role, int(p[2]), bool(b.get("reachable", True)), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "alerts"] and p[3] == "backup": out = self.service.ledger.set_backup(actor, role, int(p[2]), bool(b.get("sufficient", True)), b.get("note", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
